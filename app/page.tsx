@@ -1,11 +1,11 @@
 'use client'
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useCallback } from 'react'
 import { supabase } from '@/lib/supabase'
 import { useRouter } from 'next/navigation'
 import {
   Home, User, LogOut, MessageCircle, Heart, Share,
   Bell, Search, X as CloseIcon, Send, ArrowLeft,
-  Image as ImageIcon, Repeat2
+  Image as ImageIcon,
 } from 'lucide-react'
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -14,39 +14,35 @@ const formatarDataX = (dataStr: string) => {
   if (!dataStr) return ''
   const data = new Date(dataStr)
   const agora = new Date()
-  const diffEmSegundos = Math.floor((agora.getTime() - data.getTime()) / 1000)
-  if (diffEmSegundos < 60) return `${diffEmSegundos}s`
-  if (diffEmSegundos < 3600) return `${Math.floor(diffEmSegundos / 60)}min`
-  if (diffEmSegundos < 86400) return `${Math.floor(diffEmSegundos / 3600)}h`
+  const diff = Math.floor((agora.getTime() - data.getTime()) / 1000)
+  if (diff < 60) return `${diff}s`
+  if (diff < 3600) return `${Math.floor(diff / 60)}min`
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h`
   return data.toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' }).replace('.', '')
 }
 
-/** Converte texto com #hashtags em JSX com hashtags azuis */
-const RenderTextoComHashtags = ({ texto }: { texto: string }) => {
-  const partes = texto.split(/(#\w+)/g)
-  return (
-    <p className="mt-1 whitespace-pre-wrap break-words">
-      {partes.map((parte, i) =>
-        parte.startsWith('#')
-          ? <span key={i} className="text-sky-400 hover:underline cursor-pointer">{parte}</span>
-          : parte
-      )}
-    </p>
-  )
-}
-
-/** Converte texto com @menções e #hashtags em JSX */
-const RenderTextoComMarcacoes = ({ texto, onMencaoClick }: { texto: string; onMencaoClick?: (username: string) => void }) => {
+const RenderTextoComMarcacoes = ({
+  texto,
+  onMencaoClick,
+}: {
+  texto: string
+  onMencaoClick?: (username: string) => void
+}) => {
   const partes = texto.split(/(@\w+|#\w+)/g)
   return (
     <p className="mt-1 whitespace-pre-wrap break-words">
-      {partes.map((parte, i) =>
-        parte.startsWith('@')
-          ? <span key={i} className="text-sky-400 hover:underline cursor-pointer" onClick={() => onMencaoClick?.(parte.slice(1))}>{parte}</span>
-          : parte.startsWith('#')
-          ? <span key={i} className="text-sky-400 hover:underline cursor-pointer">{parte}</span>
-          : parte
-      )}
+      {partes.map((parte, i) => {
+        if (parte.startsWith('@'))
+          return (
+            <span key={i} className="text-sky-400 font-semibold hover:underline cursor-pointer"
+              onClick={() => onMencaoClick?.(parte.slice(1))}>
+              {parte}
+            </span>
+          )
+        if (parte.startsWith('#'))
+          return <span key={i} className="text-sky-400 hover:underline cursor-pointer">{parte}</span>
+        return parte
+      })}
     </p>
   )
 }
@@ -64,18 +60,16 @@ export default function Feed() {
   const [comentandoEm, setComentandoEm] = useState<number | null>(null)
   const [novoComentario, setNovoComentario] = useState('')
   const inputImagemRef = useRef<HTMLInputElement>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
 
-  // Notificações
   const [notificacoes, setNotificacoes] = useState<any[]>([])
   const [abaAtiva, setAbaAtiva] = useState<'home' | 'notificacoes' | 'mensagens'>('home')
 
-  // Busca
   const [busca, setBusca] = useState('')
   const [usuariosEncontrados, setUsuariosEncontrados] = useState<any[]>([])
   const [mostrarInputBusca, setMostrarInputBusca] = useState(false)
   const buscaRef = useRef<HTMLDivElement>(null)
 
-  // DMs
   const [conversas, setConversas] = useState<any[]>([])
   const [conversaAtiva, setConversaAtiva] = useState<any>(null)
   const [mensagens, setMensagens] = useState<any[]>([])
@@ -85,152 +79,54 @@ export default function Feed() {
   const [usuariosBuscaDM, setUsuariosBuscaDM] = useState<any[]>([])
   const mensagensEndRef = useRef<HTMLDivElement>(null)
 
-  // Compartilhar
   const [modalCompartilhar, setModalCompartilhar] = useState<any>(null)
   const [buscaDestinatario, setBuscaDestinatario] = useState('')
   const [usuariosBuscaCompartilhar, setUsuariosBuscaCompartilhar] = useState<any[]>([])
 
+  const [sugestoesMencao, setSugestoesMencao] = useState<any[]>([])
+  const [termoBuscaMencao, setTermoBuscaMencao] = useState('')
+  const [mostrarSugestoes, setMostrarSugestoes] = useState(false)
+
+  // Refs para usar dentro de closures de Realtime sem recriar canais
+  const userRef = useRef<any>(null)
+  const conversaAtivaRef = useRef<any>(null)
+
   const router = useRouter()
 
-  // Fecha busca ao clicar fora
-  useEffect(() => {
-    const handleClickFora = (e: MouseEvent) => {
-      if (buscaRef.current && !buscaRef.current.contains(e.target as Node)) {
-        setMostrarInputBusca(false)
-        setUsuariosEncontrados([])
-        setBusca('')
-      }
-    }
-    document.addEventListener('mousedown', handleClickFora)
-    return () => document.removeEventListener('mousedown', handleClickFora)
+  // ─── Fetch com useCallback ─────────────────────────────────────────────
+  // useCallback garante referência estável — o canal Realtime sempre chama
+  // a versão atual da função sem precisar recriar a subscription.
+
+  const fetchPosts = useCallback(async () => {
+    const { data: postsData } = await supabase
+      .from('posts')
+      .select('*, usuarios(username, full_name, avatar_url)')
+      .order('created_at', { ascending: false })
+    const { data: curtidasData } = await supabase.from('curtidas').select('*')
+    const { data: comentariosData } = await supabase
+      .from('comentarios')
+      .select('*, usuarios(username, avatar_url)')
+      .order('created_at', { ascending: true })
+
+    setPosts(
+      postsData?.map(post => ({
+        ...post,
+        lista_curtidas: curtidasData?.filter(c => c.post_id === post.id) || [],
+        comentarios: comentariosData?.filter(c => c.post_id === post.id) || [],
+      })) || []
+    )
   }, [])
 
-  // Scroll automático nas mensagens
-  useEffect(() => {
-    mensagensEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [mensagens])
-
-  // Inicialização
-  useEffect(() => {
-    let canalNotifs: any
-    let canalMsgs: any
-    let canalPosts: any
-
-    const inicializar = async () => {
-      const { data: { session } } = await supabase.auth.getSession()
-      if (!session) { router.push('/login'); return }
-
-      const { data: p } = await supabase.from('usuarios').select('*').eq('id', session.user.id).single()
-      if (!p) { await supabase.auth.signOut(); router.push('/login'); return }
-
-      setUser(session.user)
-      setPerfil(p)
-      fetchPosts()
-      fetchNotificacoes(session.user.id)
-      fetchConversas(session.user.id)
-      setLoading(false)
-
-      // Realtime: posts (novo post, curtida, comentário atualiza o feed)
-      supabase.removeChannel(supabase.channel('posts-realtime'))
-      canalPosts = supabase.channel('posts-realtime')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'posts' }, () => fetchPosts())
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'curtidas' }, () => fetchPosts())
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'comentarios' }, () => fetchPosts())
-        .subscribe()
-
-      // Realtime: notificações
-      const canalNomeNotifs = `notifs-${session.user.id}`
-      supabase.removeChannel(supabase.channel(canalNomeNotifs))
-      canalNotifs = supabase.channel(canalNomeNotifs)
-        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notificações', filter: `usuario_id=eq.${session.user.id}` },
-          async (payload) => {
-            const { data: autor } = await supabase.from('usuarios').select('username, avatar_url').eq('id', payload.new.autor_id).single()
-            setNotificacoes(prev => [{ ...payload.new, autor }, ...prev])
-          })
-        .subscribe()
-
-      // Realtime: mensagens
-      const canalNomeMsgs = `msgs-${session.user.id}`
-      supabase.removeChannel(supabase.channel(canalNomeMsgs))
-      canalMsgs = supabase.channel(canalNomeMsgs)
-        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'mensagens', filter: `destinatario_id=eq.${session.user.id}` },
-          async (payload) => {
-            fetchConversas(session.user.id)
-            setConversaAtiva((conv: any) => {
-              if (conv && conv.id === payload.new.remetente_id) {
-                setMensagens(prev => [...prev, payload.new])
-              }
-              return conv
-            })
-          })
-        .subscribe()
-    }
-
-    inicializar()
-    return () => {
-      if (canalPosts) supabase.removeChannel(canalPosts)
-      if (canalNotifs) supabase.removeChannel(canalNotifs)
-      if (canalMsgs) supabase.removeChannel(canalMsgs)
-    }
-  }, [router])
-
-  // Busca de usuários (sidebar)
-  useEffect(() => {
-    const buscar = async () => {
-      if (busca.length < 2) { setUsuariosEncontrados([]); return }
-      const { data } = await supabase.from('usuarios').select('username, full_name, avatar_url').ilike('username', `%${busca}%`).limit(5)
-      setUsuariosEncontrados(data || [])
-    }
-    const t = setTimeout(buscar, 300)
-    return () => clearTimeout(t)
-  }, [busca])
-
-  // Busca DM nova conversa
-  useEffect(() => {
-    const buscar = async () => {
-      if (buscaUsuarioDM.length < 2) { setUsuariosBuscaDM([]); return }
-      const { data } = await supabase.from('usuarios').select('id, username, full_name, avatar_url').ilike('username', `%${buscaUsuarioDM}%`).limit(5)
-      setUsuariosBuscaDM(data || [])
-    }
-    const t = setTimeout(buscar, 300)
-    return () => clearTimeout(t)
-  }, [buscaUsuarioDM])
-
-  // Busca compartilhar
-  useEffect(() => {
-    const buscar = async () => {
-      if (buscaDestinatario.length < 2) { setUsuariosBuscaCompartilhar([]); return }
-      const { data } = await supabase.from('usuarios').select('id, username, full_name, avatar_url').ilike('username', `%${buscaDestinatario}%`).limit(5)
-      setUsuariosBuscaCompartilhar(data || [])
-    }
-    const t = setTimeout(buscar, 300)
-    return () => clearTimeout(t)
-  }, [buscaDestinatario])
-
-  // ─── Fetch ──────────────────────────────────────────────────────────────
-
-  const fetchNotificacoes = async (userId: string) => {
+  const fetchNotificacoes = useCallback(async (userId: string) => {
     const { data } = await supabase
       .from('notificações')
       .select('*, autor:autor_id(username, avatar_url)')
       .eq('usuario_id', userId)
       .order('created_at', { ascending: false })
     setNotificacoes(data || [])
-  }
+  }, [])
 
-  const fetchPosts = async () => {
-    const { data: postsData } = await supabase.from('posts').select('*, usuarios(username, full_name, avatar_url)').order('created_at', { ascending: false })
-    const { data: curtidasData } = await supabase.from('curtidas').select('*')
-    const { data: comentariosData } = await supabase.from('comentarios').select('*, usuarios(username, avatar_url)').order('created_at', { ascending: true })
-    setPosts(postsData?.map(post => ({
-      ...post,
-      lista_curtidas: curtidasData?.filter(c => c.post_id === post.id) || [],
-      comentarios: comentariosData?.filter(c => c.post_id === post.id) || []
-    })) || [])
-  }
-
-  const fetchConversas = async (userId: string) => {
-    // Busca todas as mensagens envolvendo o usuário
+  const fetchConversas = useCallback(async (userId: string) => {
     const { data } = await supabase
       .from('mensagens')
       .select('*, remetente:remetente_id(id, username, avatar_url, full_name), destinatario:destinatario_id(id, username, avatar_url, full_name)')
@@ -239,69 +135,189 @@ export default function Feed() {
 
     if (!data) return
 
-    // Agrupa por conversa (par de usuários)
-    const mapaConversas = new Map<string, any>()
+    const mapa = new Map<string, any>()
     data.forEach(msg => {
       const outroId = msg.remetente_id === userId ? msg.destinatario_id : msg.remetente_id
       const outroUsuario = msg.remetente_id === userId ? msg.destinatario : msg.remetente
-      if (!mapaConversas.has(outroId)) {
-        mapaConversas.set(outroId, {
-          id: outroId,
-          usuario: outroUsuario,
-          ultimaMensagem: msg,
-          naoLidas: 0
-        })
+      if (!mapa.has(outroId)) {
+        mapa.set(outroId, { id: outroId, usuario: outroUsuario, ultimaMensagem: msg, naoLidas: 0 })
       }
       if (!msg.lida && msg.destinatario_id === userId) {
-        const conv = mapaConversas.get(outroId)!
+        const conv = mapa.get(outroId)!
         conv.naoLidas = (conv.naoLidas || 0) + 1
-        mapaConversas.set(outroId, conv)
+        mapa.set(outroId, conv)
       }
     })
-    setConversas(Array.from(mapaConversas.values()))
-  }
+    setConversas(Array.from(mapa.values()))
+  }, [])
 
-  const fetchMensagens = async (outroUserId: string) => {
-    if (!user) return
+  const fetchMensagens = useCallback(async (outroUserId: string) => {
+    const uid = userRef.current?.id
+    if (!uid) return
     const { data } = await supabase
       .from('mensagens')
       .select('*')
-      .or(`and(remetente_id.eq.${user.id},destinatario_id.eq.${outroUserId}),and(remetente_id.eq.${outroUserId},destinatario_id.eq.${user.id})`)
+      .or(`and(remetente_id.eq.${uid},destinatario_id.eq.${outroUserId}),and(remetente_id.eq.${outroUserId},destinatario_id.eq.${uid})`)
       .order('created_at', { ascending: true })
     setMensagens(data || [])
-    // Marca como lidas
-    await supabase.from('mensagens').update({ lida: true }).eq('destinatario_id', user.id).eq('remetente_id', outroUserId).eq('lida', false)
-    fetchConversas(user.id)
-  }
+    await supabase.from('mensagens').update({ lida: true })
+      .eq('destinatario_id', uid).eq('remetente_id', outroUserId).eq('lida', false)
+    fetchConversas(uid)
+  }, [fetchConversas])
 
-  // ─── Actions ─────────────────────────────────────────────────────────────
+  // ─── Inicialização + Canais Realtime ───────────────────────────────────
+
+  useEffect(() => {
+    let canalPosts: any
+    let canalNotifs: any
+    let canalMsgs: any
+
+    const inicializar = async () => {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) { router.push('/login'); return }
+
+      const { data: p } = await supabase.from('usuarios').select('*').eq('id', session.user.id).single()
+      if (!p) { await supabase.auth.signOut(); router.push('/login'); return }
+
+      userRef.current = session.user
+      setUser(session.user)
+      setPerfil(p)
+
+      await fetchPosts()
+      await fetchNotificacoes(session.user.id)
+      await fetchConversas(session.user.id)
+      setLoading(false)
+
+      // Posts: escuta INSERT/UPDATE/DELETE em posts, curtidas e comentarios
+      supabase.removeChannel(supabase.channel('feed-realtime'))
+      canalPosts = supabase.channel('feed-realtime')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'posts' }, fetchPosts)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'curtidas' }, fetchPosts)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'comentarios' }, fetchPosts)
+        .subscribe()
+
+      // Notificações: só INSERT filtrado pelo usuário logado
+      const nomeNotifs = `notifs-${session.user.id}`
+      supabase.removeChannel(supabase.channel(nomeNotifs))
+      canalNotifs = supabase.channel(nomeNotifs)
+        .on('postgres_changes',
+          { event: 'INSERT', schema: 'public', table: 'notificações', filter: `usuario_id=eq.${session.user.id}` },
+          async payload => {
+            const { data: autor } = await supabase.from('usuarios')
+              .select('username, avatar_url').eq('id', payload.new.autor_id).single()
+            setNotificacoes(prev => [{ ...payload.new, autor }, ...prev])
+          })
+        .subscribe()
+
+      // Mensagens recebidas: INSERT filtrado pelo destinatário
+      const nomeMsgs = `msgs-${session.user.id}`
+      supabase.removeChannel(supabase.channel(nomeMsgs))
+      canalMsgs = supabase.channel(nomeMsgs)
+        .on('postgres_changes',
+          { event: 'INSERT', schema: 'public', table: 'mensagens', filter: `destinatario_id=eq.${session.user.id}` },
+          payload => {
+            fetchConversas(session.user.id)
+            // conversaAtivaRef nunca fica stale — sempre aponta pro valor atual
+            if (conversaAtivaRef.current?.id === payload.new.remetente_id) {
+              setMensagens(prev => [...prev, payload.new])
+            }
+          })
+        .subscribe()
+    }
+
+    inicializar()
+
+    return () => {
+      if (canalPosts) supabase.removeChannel(canalPosts)
+      if (canalNotifs) supabase.removeChannel(canalNotifs)
+      if (canalMsgs) supabase.removeChannel(canalMsgs)
+    }
+  }, [router, fetchPosts, fetchNotificacoes, fetchConversas])
+
+  // Mantém ref de conversaAtiva sempre atual (sem recriar canais)
+  useEffect(() => { conversaAtivaRef.current = conversaAtiva }, [conversaAtiva])
+
+  // Scroll chat
+  useEffect(() => { mensagensEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [mensagens])
+
+  // Fecha busca ao clicar fora
+  useEffect(() => {
+    const fn = (e: MouseEvent) => {
+      if (buscaRef.current && !buscaRef.current.contains(e.target as Node)) {
+        setMostrarInputBusca(false); setUsuariosEncontrados([]); setBusca('')
+      }
+    }
+    document.addEventListener('mousedown', fn)
+    return () => document.removeEventListener('mousedown', fn)
+  }, [])
+
+  // Buscas com debounce
+  useEffect(() => {
+    const t = setTimeout(async () => {
+      if (busca.length < 2) { setUsuariosEncontrados([]); return }
+      const { data } = await supabase.from('usuarios').select('username, full_name, avatar_url').ilike('username', `%${busca}%`).limit(5)
+      setUsuariosEncontrados(data || [])
+    }, 300)
+    return () => clearTimeout(t)
+  }, [busca])
+
+  useEffect(() => {
+    const t = setTimeout(async () => {
+      if (buscaUsuarioDM.length < 2) { setUsuariosBuscaDM([]); return }
+      const { data } = await supabase.from('usuarios').select('id, username, full_name, avatar_url').ilike('username', `%${buscaUsuarioDM}%`).limit(5)
+      setUsuariosBuscaDM(data || [])
+    }, 300)
+    return () => clearTimeout(t)
+  }, [buscaUsuarioDM])
+
+  useEffect(() => {
+    const t = setTimeout(async () => {
+      if (buscaDestinatario.length < 2) { setUsuariosBuscaCompartilhar([]); return }
+      const { data } = await supabase.from('usuarios').select('id, username, full_name, avatar_url').ilike('username', `%${buscaDestinatario}%`).limit(5)
+      setUsuariosBuscaCompartilhar(data || [])
+    }, 300)
+    return () => clearTimeout(t)
+  }, [buscaDestinatario])
+
+  useEffect(() => {
+    const t = setTimeout(async () => {
+      if (termoBuscaMencao.length < 1) { setSugestoesMencao([]); return }
+      const { data } = await supabase.from('usuarios').select('id, username, full_name, avatar_url').ilike('username', `%${termoBuscaMencao}%`).limit(5)
+      setSugestoesMencao(data || [])
+    }, 200)
+    return () => clearTimeout(t)
+  }, [termoBuscaMencao])
+
+  // ─── Actions ──────────────────────────────────────────────────────────
 
   const marcarComoLidas = async () => {
-    if (!user || !notificacoes.some(n => !n.lida)) return
-    await supabase.from('notificações').update({ lida: true }).eq('usuario_id', user.id).eq('lida', false)
+    const uid = userRef.current?.id
+    if (!uid || !notificacoes.some(n => !n.lida)) return
+    await supabase.from('notificações').update({ lida: true }).eq('usuario_id', uid).eq('lida', false)
     setNotificacoes(prev => prev.map(n => ({ ...n, lida: true })))
   }
 
-  async function criarNotificacao(destinatarioId: string, tipo: 'curtida' | 'comentario' | 'mensagem', postId?: number) {
-    if (!user || destinatarioId === user.id) return
-    await supabase.from('notificações').insert({
-      usuario_id: destinatarioId,
-      autor_id: user.id,
-      tipo,
-      post_id: postId || null
-    })
+  const criarNotificacao = async (
+    destinatarioId: string,
+    tipo: 'curtida' | 'comentario' | 'mensagem' | 'mencao',
+    postId?: number
+  ) => {
+    const uid = userRef.current?.id
+    if (!uid || destinatarioId === uid) return
+    await supabase.from('notificações').insert({ usuario_id: destinatarioId, autor_id: uid, tipo, post_id: postId || null })
   }
 
   const gerenciarLike = async (post: any) => {
-    if (!user) return
-    const euCurti = post.lista_curtidas?.some((c: any) => c.usuario_id === user.id)
+    const uid = userRef.current?.id
+    if (!uid) return
+    const euCurti = post.lista_curtidas?.some((c: any) => c.usuario_id === uid)
     if (euCurti) {
-      await supabase.from('curtidas').delete().eq('post_id', post.id).eq('usuario_id', user.id)
+      await supabase.from('curtidas').delete().eq('post_id', post.id).eq('usuario_id', uid)
     } else {
-      await supabase.from('curtidas').insert([{ post_id: post.id, usuario_id: user.id }])
+      await supabase.from('curtidas').insert([{ post_id: post.id, usuario_id: uid }])
       await criarNotificacao(post.usuario_id, 'curtida', post.id)
     }
-    fetchPosts()
+    // Realtime já dispara fetchPosts — não precisa chamar manualmente
   }
 
   const selecionarImagem = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -311,68 +327,95 @@ export default function Feed() {
     setImagemPreview(URL.createObjectURL(file))
   }
 
+  const handleTextoChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const val = e.target.value
+    setTexto(val)
+    const cursor = e.target.selectionStart
+    const match = val.slice(0, cursor).match(/@(\w*)$/)
+    if (match) {
+      setTermoBuscaMencao(match[1])
+      setMostrarSugestoes(true)
+    } else {
+      setMostrarSugestoes(false)
+      setTermoBuscaMencao('')
+      setSugestoesMencao([])
+    }
+  }
+
+  const selecionarMencao = (username: string) => {
+    const cursor = textareaRef.current?.selectionStart ?? texto.length
+    const antes = texto.slice(0, cursor).replace(/@(\w*)$/, `@${username} `)
+    setTexto(antes + texto.slice(cursor))
+    setMostrarSugestoes(false)
+    setSugestoesMencao([])
+    setTermoBuscaMencao('')
+    setTimeout(() => textareaRef.current?.focus(), 0)
+  }
+
+  const notificarMencoes = async (textoPost: string, postId: number) => {
+    const mencoes = textoPost.match(/@(\w+)/g)
+    if (!mencoes) return
+    for (const username of [...new Set(mencoes.map(m => m.slice(1)))]) {
+      const { data } = await supabase.from('usuarios').select('id').eq('username', username).single()
+      if (data) await criarNotificacao(data.id, 'mencao', postId)
+    }
+  }
+
   const enviarPost = async () => {
-    if (!texto.trim() && !imagemPost) return
+    const uid = userRef.current?.id
+    if (!uid || (!texto.trim() && !imagemPost)) return
 
     let imagemUrl: string | null = null
-
     if (imagemPost) {
-      const nomeArquivo = `${user.id}/${Date.now()}-${imagemPost.name}`
-      const { error: uploadError } = await supabase.storage
-        .from('posts-imagens')
-        .upload(nomeArquivo, imagemPost)
-
-      if (uploadError) {
-        console.error('Erro no upload da imagem:', uploadError)
-        return
-      }
-
-      const { data: urlData } = supabase.storage
-        .from('posts-imagens')
-        .getPublicUrl(nomeArquivo)
+      const nomeArquivo = `${uid}/${Date.now()}-${imagemPost.name}`
+      const { error: uploadError } = await supabase.storage.from('posts-imagens').upload(nomeArquivo, imagemPost)
+      if (uploadError) { console.error('Upload falhou:', uploadError); return }
+      const { data: urlData } = supabase.storage.from('posts-imagens').getPublicUrl(nomeArquivo)
       imagemUrl = urlData.publicUrl
     }
 
-    const { error } = await supabase.from('posts').insert([{
-      conteudo: texto,
-      usuario_id: user.id,
-      imagem_url: imagemUrl
-    }])
+    const { data: postCriado, error } = await supabase
+      .from('posts')
+      .insert([{ conteudo: texto, usuario_id: uid, imagem_url: imagemUrl }])
+      .select('id')
+      .single()
 
-    if (!error) {
+    if (!error && postCriado) {
+      await notificarMencoes(texto, postCriado.id)
       setTexto('')
       setImagemPost(null)
       setImagemPreview(null)
-      // sem fetchPosts() — o Realtime cuida disso automaticamente
+      // Realtime cuida de atualizar o feed
     }
   }
 
   const enviarComentario = async (post: any) => {
-    if (!novoComentario.trim() || !user) return
-    const { error } = await supabase.from('comentarios').insert([{ post_id: post.id, usuario_id: user.id, conteudo: novoComentario }])
+    const uid = userRef.current?.id
+    if (!novoComentario.trim() || !uid) return
+    const { error } = await supabase.from('comentarios')
+      .insert([{ post_id: post.id, usuario_id: uid, conteudo: novoComentario }])
     if (!error) {
       await criarNotificacao(post.usuario_id, 'comentario', post.id)
       setNovoComentario('')
-      fetchPosts()
+      // Realtime cuida do fetchPosts
     }
   }
 
   const enviarMensagem = async () => {
-    if (!novaMensagem.trim() || !conversaAtiva || !user) return
-    await supabase.from('mensagens').insert([{
-      remetente_id: user.id,
-      destinatario_id: conversaAtiva.id,
-      conteudo: novaMensagem
-    }])
-    setMensagens(prev => [...prev, {
-      remetente_id: user.id,
+    const uid = userRef.current?.id
+    if (!novaMensagem.trim() || !conversaAtiva || !uid) return
+    // Optimistic update: aparece na tela antes da resposta do servidor
+    const msgLocal = {
+      remetente_id: uid,
       destinatario_id: conversaAtiva.id,
       conteudo: novaMensagem,
       created_at: new Date().toISOString(),
-      lida: false
-    }])
+      lida: false,
+    }
+    setMensagens(prev => [...prev, msgLocal])
     setNovaMensagem('')
-    fetchConversas(user.id)
+    await supabase.from('mensagens').insert([{ remetente_id: uid, destinatario_id: conversaAtiva.id, conteudo: novaMensagem }])
+    fetchConversas(uid)
   }
 
   const abrirConversa = (outroUsuario: any) => {
@@ -384,27 +427,28 @@ export default function Feed() {
   }
 
   const compartilharViaMsg = async (destinatario: any, post: any) => {
-    if (!user) return
-    const textoCompartilhado = `Olha esse post de @${post.usuarios?.username}: "${post.conteudo}"`
+    const uid = userRef.current?.id
+    if (!uid) return
     await supabase.from('mensagens').insert([{
-      remetente_id: user.id,
+      remetente_id: uid,
       destinatario_id: destinatario.id,
-      conteudo: textoCompartilhado
+      conteudo: `Olha esse post de @${post.usuarios?.username}: "${post.conteudo}"`,
     }])
     setModalCompartilhar(null)
     setBuscaDestinatario('')
     setUsuariosBuscaCompartilhar([])
   }
 
-  // ─── Sub-components ──────────────────────────────────────────────────────
+  // ─── Sub-components ───────────────────────────────────────────────────
 
-  const RenderAvatar = ({ url, username, size = "w-10 h-10" }: any) => (
+  const RenderAvatar = ({ url, username, size = 'w-10 h-10' }: any) => (
     <div className={`${size} bg-sky-600 rounded-full flex items-center justify-center font-bold uppercase shrink-0 cursor-pointer overflow-hidden border border-gray-800`}>
       {url ? <img src={url} alt={username} className="w-full h-full object-cover" /> : <span>{username?.[0]}</span>}
     </div>
   )
 
-  if (loading) return <div className="bg-black min-h-screen text-white flex items-center justify-center font-bold text-4xl italic">X</div>
+  if (loading)
+    return <div className="bg-black min-h-screen text-white flex items-center justify-center font-bold text-4xl italic">X</div>
 
   const qndNaoLidas = notificacoes.filter(n => !n.lida).length
   const totalMsgNaoLidas = conversas.reduce((acc, c) => acc + (c.naoLidas || 0), 0)
@@ -412,14 +456,13 @@ export default function Feed() {
   return (
     <div className="flex min-h-screen bg-black text-[#e7e9ea] max-w-[1250px] mx-auto font-sans">
 
-      {/* ── SIDEBAR ─────────────────────────────────────────────────────── */}
+      {/* ── SIDEBAR ── */}
       <aside className="w-20 xl:w-64 p-2 border-r border-gray-800 sticky top-0 h-screen flex flex-col justify-between shrink-0">
         <div className="space-y-4">
           <div className="p-3 text-3xl font-bold cursor-pointer hover:bg-gray-900 w-fit rounded-full transition"
             onClick={() => { setAbaAtiva('home'); setConversaAtiva(null) }}>X</div>
           <nav className="text-xl font-bold space-y-2">
 
-            {/* Home */}
             <div onClick={() => { setAbaAtiva('home'); setConversaAtiva(null) }}
               className="flex items-center gap-5 p-3 hover:bg-gray-900 rounded-full cursor-pointer transition">
               <Home size={28} /> <span className="hidden xl:inline">Home</span>
@@ -436,7 +479,7 @@ export default function Feed() {
                 <div className="px-3 py-2">
                   <div className="flex items-center gap-2 bg-[#202327] p-3 rounded-full border border-sky-500">
                     <Search size={20} className="text-sky-500 shrink-0" />
-                    <input autoFocus value={busca} onChange={(e) => setBusca(e.target.value)}
+                    <input autoFocus value={busca} onChange={e => setBusca(e.target.value)}
                       placeholder="Buscar..." className="bg-transparent outline-none text-sm w-full" />
                   </div>
                   {usuariosEncontrados.length > 0 && (
@@ -458,7 +501,6 @@ export default function Feed() {
               )}
             </div>
 
-            {/* Perfil */}
             <div onClick={() => router.push(`/perfil/${perfil?.username}`)}
               className="flex items-center gap-5 p-3 hover:bg-gray-900 rounded-full cursor-pointer transition">
               <User size={28} /> <span className="hidden xl:inline">Perfil</span>
@@ -500,10 +542,10 @@ export default function Feed() {
         </button>
       </aside>
 
-      {/* ── ÁREA CENTRAL ────────────────────────────────────────────────── */}
+      {/* ── ÁREA CENTRAL ── */}
       <main className="flex-1 border-r border-gray-800 max-w-[600px] w-full">
 
-        {/* ── HEADER ── */}
+        {/* Header */}
         <div className="p-4 border-b border-gray-800 sticky top-0 bg-black/80 backdrop-blur-md z-10 flex justify-between items-center">
           {abaAtiva === 'mensagens' && conversaAtiva ? (
             <div className="flex items-center gap-3">
@@ -536,18 +578,39 @@ export default function Feed() {
           )}
         </div>
 
-        {/* ── ABA HOME ── */}
+        {/* ── HOME ── */}
         {abaAtiva === 'home' && (
           <>
-            {/* Input de post */}
+            {/* Composer */}
             <div className="p-4 border-b border-gray-800 flex gap-4">
               <RenderAvatar url={perfil?.avatar_url} username={perfil?.username} />
               <div className="flex-1">
-                <textarea value={texto} onChange={e => setTexto(e.target.value)}
-                  className="w-full bg-transparent text-xl outline-none placeholder-gray-600 resize-none mt-2"
-                  placeholder="O que está acontecendo? Use #hashtags!" rows={2} />
+                <div className="relative">
+                  <textarea
+                    ref={textareaRef}
+                    value={texto}
+                    onChange={handleTextoChange}
+                    className="w-full bg-transparent text-xl outline-none placeholder-gray-600 resize-none mt-2"
+                    placeholder="O que está acontecendo? Use #hashtags e @mencoes!"
+                    rows={2}
+                  />
+                  {mostrarSugestoes && sugestoesMencao.length > 0 && (
+                    <div className="absolute left-0 top-full mt-1 bg-[#0f0f0f] border border-gray-800 rounded-xl shadow-2xl z-50 w-64 overflow-hidden">
+                      {sugestoesMencao.map(u => (
+                        <div key={u.id}
+                          onMouseDown={e => { e.preventDefault(); selecionarMencao(u.username) }}
+                          className="flex items-center gap-3 p-3 hover:bg-white/5 cursor-pointer">
+                          <RenderAvatar url={u.avatar_url} username={u.username} size="w-8 h-8" />
+                          <div className="text-sm">
+                            <p className="font-bold">{u.full_name}</p>
+                            <p className="text-gray-500 text-xs">@{u.username}</p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
 
-                {/* Preview da imagem */}
                 {imagemPreview && (
                   <div className="relative mt-2 rounded-xl overflow-hidden border border-gray-800">
                     <img src={imagemPreview} alt="preview" className="w-full max-h-72 object-cover" />
@@ -572,7 +635,7 @@ export default function Feed() {
               </div>
             </div>
 
-            {/* Lista de posts */}
+            {/* Feed de posts */}
             <div className="divide-y divide-gray-800">
               {posts.map(post => {
                 const jaCurti = post.lista_curtidas?.some((c: any) => c.usuario_id === user?.id)
@@ -589,39 +652,38 @@ export default function Feed() {
                           <span className="text-gray-500 text-sm">· {formatarDataX(post.created_at)}</span>
                         </div>
 
-                        <RenderTextoComMarcacoes texto={post.conteudo || ''} onMencaoClick={(u) => router.push(`/perfil/${u}`)} />
+                        <RenderTextoComMarcacoes texto={post.conteudo || ''} onMencaoClick={u => router.push(`/perfil/${u}`)} />
 
-                        {/* Imagem do post */}
                         {post.imagem_url && (
                           <div className="mt-2 rounded-xl overflow-hidden border border-gray-800">
-                            <img src={post.imagem_url} alt="imagem do post" className="w-full max-h-80 object-cover" />
+                            <img src={post.imagem_url} alt="imagem" className="w-full max-h-80 object-cover" />
                           </div>
                         )}
 
                         <div className="flex justify-between mt-3 text-gray-500 max-w-md">
                           <div onClick={() => setComentandoEm(comentandoEm === post.id ? null : post.id)}
                             className="flex items-center gap-2 cursor-pointer hover:text-sky-500 transition">
-                            <MessageCircle size={18} /> <span className="text-xs">{post.comentarios?.length}</span>
+                            <MessageCircle size={18} />
+                            <span className="text-xs">{post.comentarios?.length}</span>
                           </div>
                           <div onClick={() => gerenciarLike(post)}
                             className={`flex items-center gap-2 cursor-pointer hover:text-pink-500 transition ${jaCurti ? 'text-pink-500' : ''}`}>
-                            <Heart size={18} className={jaCurti ? "fill-pink-500" : ""} />
+                            <Heart size={18} className={jaCurti ? 'fill-pink-500' : ''} />
                             <span className="text-xs">{post.lista_curtidas?.length}</span>
                           </div>
-                          {/* Botão compartilhar */}
                           <div onClick={() => { setModalCompartilhar(post); setBuscaDestinatario(''); setUsuariosBuscaCompartilhar([]) }}
                             className="flex items-center gap-2 cursor-pointer hover:text-green-500 transition">
                             <Share size={18} />
                           </div>
                         </div>
 
-                        {/* Comentários */}
                         {comentandoEm === post.id && (
                           <div className="mt-4 space-y-4">
                             <div className="flex gap-3">
                               <RenderAvatar url={perfil?.avatar_url} username={perfil?.username} size="w-8 h-8" />
                               <div className="flex-1 flex gap-2">
                                 <input value={novoComentario} onChange={e => setNovoComentario(e.target.value)}
+                                  onKeyDown={e => e.key === 'Enter' && enviarComentario(post)}
                                   className="flex-1 bg-zinc-900 rounded-full px-4 py-1 text-sm outline-none border border-transparent focus:border-sky-500"
                                   placeholder="Sua resposta..." />
                                 <button onClick={() => enviarComentario(post)}
@@ -650,7 +712,7 @@ export default function Feed() {
           </>
         )}
 
-        {/* ── ABA NOTIFICAÇÕES ── */}
+        {/* ── NOTIFICAÇÕES ── */}
         {abaAtiva === 'notificacoes' && (
           <div className="divide-y divide-gray-800">
             {notificacoes.length === 0 ? (
@@ -664,7 +726,7 @@ export default function Feed() {
                     {n.tipo === 'comentario' && <MessageCircle size={22} className="text-sky-500 fill-sky-500" />}
                     {n.tipo === 'seguidor' && <User size={22} className="text-sky-400" />}
                     {n.tipo === 'mensagem' && <Send size={22} className="text-green-400" />}
-                    {n.tipo === 'mencao' && <span className="text-sky-400 font-bold text-lg">@</span>}
+                    {n.tipo === 'mencao' && <span className="text-sky-400 font-bold text-lg leading-none">@</span>}
                   </div>
                   <div className="flex-1">
                     <div className="flex items-center gap-2 mb-1 cursor-pointer"
@@ -687,11 +749,10 @@ export default function Feed() {
           </div>
         )}
 
-        {/* ── ABA MENSAGENS ── */}
+        {/* ── MENSAGENS ── */}
         {abaAtiva === 'mensagens' && (
           <>
             {!conversaAtiva ? (
-              /* Lista de conversas */
               <div className="divide-y divide-gray-800">
                 {conversas.length === 0 ? (
                   <p className="p-10 text-center text-gray-500 italic">Nenhuma conversa ainda.</p>
@@ -721,7 +782,6 @@ export default function Feed() {
                 )}
               </div>
             ) : (
-              /* Chat ativo */
               <div className="flex flex-col h-[calc(100vh-65px)]">
                 <div className="flex-1 overflow-y-auto p-4 space-y-3">
                   {mensagens.map((msg, i) => {
@@ -739,7 +799,6 @@ export default function Feed() {
                   })}
                   <div ref={mensagensEndRef} />
                 </div>
-                {/* Input de mensagem */}
                 <div className="p-4 border-t border-gray-800 flex gap-3 items-center">
                   <input value={novaMensagem} onChange={e => setNovaMensagem(e.target.value)}
                     onKeyDown={e => e.key === 'Enter' && !e.shiftKey && enviarMensagem()}
@@ -756,13 +815,17 @@ export default function Feed() {
         )}
       </main>
 
-      {/* ── MODAL: Nova Conversa ─────────────────────────────────────────── */}
+      {/* ── MODAL: Nova Conversa ── */}
       {mostrarModalNovaConversa && (
-        <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4" onClick={() => setMostrarModalNovaConversa(false)}>
-          <div className="bg-[#0f0f0f] border border-gray-800 rounded-2xl w-full max-w-sm shadow-2xl" onClick={e => e.stopPropagation()}>
+        <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4"
+          onClick={() => setMostrarModalNovaConversa(false)}>
+          <div className="bg-[#0f0f0f] border border-gray-800 rounded-2xl w-full max-w-sm shadow-2xl"
+            onClick={e => e.stopPropagation()}>
             <div className="flex items-center justify-between p-4 border-b border-gray-800">
               <h2 className="font-bold text-lg">Nova mensagem</h2>
-              <button onClick={() => setMostrarModalNovaConversa(false)} className="hover:bg-gray-900 p-2 rounded-full"><CloseIcon size={18} /></button>
+              <button onClick={() => setMostrarModalNovaConversa(false)} className="hover:bg-gray-900 p-2 rounded-full">
+                <CloseIcon size={18} />
+              </button>
             </div>
             <div className="p-4">
               <div className="flex items-center gap-2 bg-[#202327] p-3 rounded-full border border-sky-500">
@@ -772,7 +835,8 @@ export default function Feed() {
               </div>
               <div className="mt-2 space-y-1">
                 {usuariosBuscaDM.map(u => (
-                  <div key={u.id} onClick={() => { abrirConversa({ id: u.id, usuario: u }); setAbaAtiva('mensagens') }}
+                  <div key={u.id}
+                    onClick={() => { abrirConversa({ id: u.id, usuario: u }); setAbaAtiva('mensagens') }}
                     className="flex items-center gap-3 p-3 hover:bg-white/5 rounded-xl cursor-pointer">
                     <RenderAvatar url={u.avatar_url} username={u.username} size="w-9 h-9" />
                     <div>
@@ -787,15 +851,18 @@ export default function Feed() {
         </div>
       )}
 
-      {/* ── MODAL: Compartilhar Post ─────────────────────────────────────── */}
+      {/* ── MODAL: Compartilhar ── */}
       {modalCompartilhar && (
-        <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4" onClick={() => setModalCompartilhar(null)}>
-          <div className="bg-[#0f0f0f] border border-gray-800 rounded-2xl w-full max-w-sm shadow-2xl" onClick={e => e.stopPropagation()}>
+        <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4"
+          onClick={() => setModalCompartilhar(null)}>
+          <div className="bg-[#0f0f0f] border border-gray-800 rounded-2xl w-full max-w-sm shadow-2xl"
+            onClick={e => e.stopPropagation()}>
             <div className="flex items-center justify-between p-4 border-b border-gray-800">
               <h2 className="font-bold text-lg">Compartilhar via mensagem</h2>
-              <button onClick={() => setModalCompartilhar(null)} className="hover:bg-gray-900 p-2 rounded-full"><CloseIcon size={18} /></button>
+              <button onClick={() => setModalCompartilhar(null)} className="hover:bg-gray-900 p-2 rounded-full">
+                <CloseIcon size={18} />
+              </button>
             </div>
-            {/* Preview do post */}
             <div className="mx-4 mt-4 p-3 bg-white/5 border border-gray-800 rounded-xl text-sm text-gray-400 line-clamp-2">
               <span className="font-bold text-white">@{modalCompartilhar.usuarios?.username}</span> · {modalCompartilhar.conteudo}
             </div>
