@@ -35,6 +35,22 @@ const RenderTextoComHashtags = ({ texto }: { texto: string }) => {
   )
 }
 
+/** Converte texto com @menções e #hashtags em JSX */
+const RenderTextoComMarcacoes = ({ texto, onMencaoClick }: { texto: string; onMencaoClick?: (username: string) => void }) => {
+  const partes = texto.split(/(@\w+|#\w+)/g)
+  return (
+    <p className="mt-1 whitespace-pre-wrap break-words">
+      {partes.map((parte, i) =>
+        parte.startsWith('@')
+          ? <span key={i} className="text-sky-400 hover:underline cursor-pointer" onClick={() => onMencaoClick?.(parte.slice(1))}>{parte}</span>
+          : parte.startsWith('#')
+          ? <span key={i} className="text-sky-400 hover:underline cursor-pointer">{parte}</span>
+          : parte
+      )}
+    </p>
+  )
+}
+
 // ─── Componente Principal ──────────────────────────────────────────────────
 
 export default function Feed() {
@@ -573,7 +589,7 @@ export default function Feed() {
                           <span className="text-gray-500 text-sm">· {formatarDataX(post.created_at)}</span>
                         </div>
 
-                        <RenderTextoComHashtags texto={post.conteudo || ''} />
+                        <RenderTextoComMarcacoes texto={post.conteudo || ''} onMencaoClick={(u) => router.push(`/perfil/${u}`)} />
 
                         {/* Imagem do post */}
                         {post.imagem_url && (
@@ -648,6 +664,7 @@ export default function Feed() {
                     {n.tipo === 'comentario' && <MessageCircle size={22} className="text-sky-500 fill-sky-500" />}
                     {n.tipo === 'seguidor' && <User size={22} className="text-sky-400" />}
                     {n.tipo === 'mensagem' && <Send size={22} className="text-green-400" />}
+                    {n.tipo === 'mencao' && <span className="text-sky-400 font-bold text-lg">@</span>}
                   </div>
                   <div className="flex-1">
                     <div className="flex items-center gap-2 mb-1 cursor-pointer"
@@ -660,6 +677,7 @@ export default function Feed() {
                       {n.tipo === 'comentario' && 'comentou no seu post'}
                       {n.tipo === 'seguidor' && 'começou a te seguir'}
                       {n.tipo === 'mensagem' && 'te enviou uma mensagem'}
+                      {n.tipo === 'mencao' && 'te mencionou em um post'}
                     </p>
                     <span className="text-[10px] text-gray-500 uppercase font-bold mt-1 block">{formatarDataX(n.created_at)}</span>
                   </div>
