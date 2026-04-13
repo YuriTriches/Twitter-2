@@ -1,214 +1,797 @@
 'use client'
-import { useEffect, useState } from 'react'
-import { supabase } from '@/lib/supabase' 
+import { useEffect, useState, useRef } from 'react'
+import { supabase } from '@/lib/supabase'
 import { useRouter } from 'next/navigation'
-import { Home, User, LogOut, MessageCircle, Heart, Share, MoreHorizontal } from 'lucide-react'
+import {
+  Home, User, LogOut, MessageCircle, Heart, Share,
+  Bell, Search, X as CloseIcon, Send, ArrowLeft,
+  Image as ImageIcon, Repeat2
+} from 'lucide-react'
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
+
+const formatarDataX = (dataStr: string) => {
+  if (!dataStr) return ''
+  const data = new Date(dataStr)
+  const agora = new Date()
+  const diffEmSegundos = Math.floor((agora.getTime() - data.getTime()) / 1000)
+  if (diffEmSegundos < 60) return `${diffEmSegundos}s`
+  if (diffEmSegundos < 3600) return `${Math.floor(diffEmSegundos / 60)}min`
+  if (diffEmSegundos < 86400) return `${Math.floor(diffEmSegundos / 3600)}h`
+  return data.toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' }).replace('.', '')
+}
+
+/** Converte texto com #hashtags em JSX com hashtags azuis */
+const RenderTextoComHashtags = ({ texto }: { texto: string }) => {
+  const partes = texto.split(/(#\w+)/g)
+  return (
+    <p className="mt-1 whitespace-pre-wrap break-words">
+      {partes.map((parte, i) =>
+        parte.startsWith('#')
+          ? <span key={i} className="text-sky-400 hover:underline cursor-pointer">{parte}</span>
+          : parte
+      )}
+    </p>
+  )
+}
+
+// ─── Componente Principal ──────────────────────────────────────────────────
 
 export default function Feed() {
   const [user, setUser] = useState<any>(null)
   const [perfil, setPerfil] = useState<any>(null)
   const [texto, setTexto] = useState('')
+  const [imagemPost, setImagemPost] = useState<File | null>(null)
+  const [imagemPreview, setImagemPreview] = useState<string | null>(null)
   const [posts, setPosts] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [comentandoEm, setComentandoEm] = useState<number | null>(null)
   const [novoComentario, setNovoComentario] = useState('')
+  const inputImagemRef = useRef<HTMLInputElement>(null)
+
+  // Notificações
+  const [notificacoes, setNotificacoes] = useState<any[]>([])
+  const [abaAtiva, setAbaAtiva] = useState<'home' | 'notificacoes' | 'mensagens'>('home')
+
+  // Busca
+  const [busca, setBusca] = useState('')
+  const [usuariosEncontrados, setUsuariosEncontrados] = useState<any[]>([])
+  const [mostrarInputBusca, setMostrarInputBusca] = useState(false)
+  const buscaRef = useRef<HTMLDivElement>(null)
+
+  // DMs
+  const [conversas, setConversas] = useState<any[]>([])
+  const [conversaAtiva, setConversaAtiva] = useState<any>(null)
+  const [mensagens, setMensagens] = useState<any[]>([])
+  const [novaMensagem, setNovaMensagem] = useState('')
+  const [mostrarModalNovaConversa, setMostrarModalNovaConversa] = useState(false)
+  const [buscaUsuarioDM, setBuscaUsuarioDM] = useState('')
+  const [usuariosBuscaDM, setUsuariosBuscaDM] = useState<any[]>([])
+  const mensagensEndRef = useRef<HTMLDivElement>(null)
+
+  // Compartilhar
+  const [modalCompartilhar, setModalCompartilhar] = useState<any>(null)
+  const [buscaDestinatario, setBuscaDestinatario] = useState('')
+  const [usuariosBuscaCompartilhar, setUsuariosBuscaCompartilhar] = useState<any[]>([])
+
   const router = useRouter()
 
+  // Fecha busca ao clicar fora
   useEffect(() => {
-    const checkUser = async () => {
+    const handleClickFora = (e: MouseEvent) => {
+      if (buscaRef.current && !buscaRef.current.contains(e.target as Node)) {
+        setMostrarInputBusca(false)
+        setUsuariosEncontrados([])
+        setBusca('')
+      }
+    }
+    document.addEventListener('mousedown', handleClickFora)
+    return () => document.removeEventListener('mousedown', handleClickFora)
+  }, [])
+
+  // Scroll automático nas mensagens
+  useEffect(() => {
+    mensagensEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [mensagens])
+
+  // Inicialização
+  useEffect(() => {
+    let canalNotifs: any
+    let canalMsgs: any
+
+    const inicializar = async () => {
       const { data: { session } } = await supabase.auth.getSession()
-      if (!session) { router.push('/login'); return; }
+      if (!session) { router.push('/login'); return }
 
       const { data: p } = await supabase.from('usuarios').select('*').eq('id', session.user.id).single()
-      
-      if (!p) {
-        await supabase.auth.signOut(); router.push('/login')
-      } else {
-        setUser(session.user); 
-        setPerfil(p); 
-        fetchPosts(session.user.id);
-      }
+      if (!p) { await supabase.auth.signOut(); router.push('/login'); return }
+
+      setUser(session.user)
+      setPerfil(p)
+      fetchPosts()
+      fetchNotificacoes(session.user.id)
+      fetchConversas(session.user.id)
       setLoading(false)
+
+      // Realtime: notificações
+      const canalNomeNotifs = `notifs-${session.user.id}`
+      supabase.removeChannel(supabase.channel(canalNomeNotifs))
+      canalNotifs = supabase.channel(canalNomeNotifs)
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notificações', filter: `usuario_id=eq.${session.user.id}` },
+          async (payload) => {
+            const { data: autor } = await supabase.from('usuarios').select('username, avatar_url').eq('id', payload.new.autor_id).single()
+            setNotificacoes(prev => [{ ...payload.new, autor }, ...prev])
+          })
+        .subscribe()
+
+      // Realtime: mensagens
+      const canalNomeMsgs = `msgs-${session.user.id}`
+      supabase.removeChannel(supabase.channel(canalNomeMsgs))
+      canalMsgs = supabase.channel(canalNomeMsgs)
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'mensagens', filter: `destinatario_id=eq.${session.user.id}` },
+          async (payload) => {
+            // Atualiza badge de mensagens não lidas
+            fetchConversas(session.user.id)
+            // Se a conversa com esse remetente está aberta, adiciona a mensagem
+            setConversaAtiva((conv: any) => {
+              if (conv && conv.id === payload.new.remetente_id) {
+                setMensagens(prev => [...prev, payload.new])
+              }
+              return conv
+            })
+          })
+        .subscribe()
     }
-    checkUser()
+
+    inicializar()
+    return () => {
+      if (canalNotifs) supabase.removeChannel(canalNotifs)
+      if (canalMsgs) supabase.removeChannel(canalMsgs)
+    }
   }, [router])
 
-  const fetchPosts = async (userId?: string) => {
-    const idParaVerificar = userId || user?.id;
-
-    // 1. Busca os posts
-    const { data: postsData, error: postsError } = await supabase
-      .from('posts')
-      .select('*, usuarios(username, full_name)')
-      .order('created_at', { ascending: false });
-
-    if (postsError) {
-      console.error("Erro nos posts:", postsError.message);
-      return;
+  // Busca de usuários (sidebar)
+  useEffect(() => {
+    const buscar = async () => {
+      if (busca.length < 2) { setUsuariosEncontrados([]); return }
+      const { data } = await supabase.from('usuarios').select('username, full_name, avatar_url').ilike('username', `%${busca}%`).limit(5)
+      setUsuariosEncontrados(data || [])
     }
+    const t = setTimeout(buscar, 300)
+    return () => clearTimeout(t)
+  }, [busca])
 
-    // 2. Busca curtidas
-    const { data: curtidasData } = await supabase.from('curtidas').select('*');
+  // Busca DM nova conversa
+  useEffect(() => {
+    const buscar = async () => {
+      if (buscaUsuarioDM.length < 2) { setUsuariosBuscaDM([]); return }
+      const { data } = await supabase.from('usuarios').select('id, username, full_name, avatar_url').ilike('username', `%${buscaUsuarioDM}%`).limit(5)
+      setUsuariosBuscaDM(data || [])
+    }
+    const t = setTimeout(buscar, 300)
+    return () => clearTimeout(t)
+  }, [buscaUsuarioDM])
 
-    // 3. Busca comentários (Query robusta para evitar erro 400)
-    const { data: comentariosData, error: comError } = await supabase
-      .from('comentarios')
-      .select('id, post_id, conteudo, usuario_id, usuarios(username)');
+  // Busca compartilhar
+  useEffect(() => {
+    const buscar = async () => {
+      if (buscaDestinatario.length < 2) { setUsuariosBuscaCompartilhar([]); return }
+      const { data } = await supabase.from('usuarios').select('id, username, full_name, avatar_url').ilike('username', `%${buscaDestinatario}%`).limit(5)
+      setUsuariosBuscaCompartilhar(data || [])
+    }
+    const t = setTimeout(buscar, 300)
+    return () => clearTimeout(t)
+  }, [buscaDestinatario])
 
-    if (comError) console.error("Erro nos comentários:", comError.message);
+  // ─── Fetch ──────────────────────────────────────────────────────────────
 
-    // 4. Monta o Feed
-    const feedFormatado = postsData?.map(post => ({
+  const fetchNotificacoes = async (userId: string) => {
+    const { data } = await supabase
+      .from('notificações')
+      .select('*, autor:autor_id(username, avatar_url)')
+      .eq('usuario_id', userId)
+      .order('created_at', { ascending: false })
+    setNotificacoes(data || [])
+  }
+
+  const fetchPosts = async () => {
+    const { data: postsData } = await supabase.from('posts').select('*, usuarios(username, full_name, avatar_url)').order('created_at', { ascending: false })
+    const { data: curtidasData } = await supabase.from('curtidas').select('*')
+    const { data: comentariosData } = await supabase.from('comentarios').select('*, usuarios(username, avatar_url)').order('created_at', { ascending: true })
+    setPosts(postsData?.map(post => ({
       ...post,
       lista_curtidas: curtidasData?.filter(c => c.post_id === post.id) || [],
       comentarios: comentariosData?.filter(c => c.post_id === post.id) || []
-    }));
+    })) || [])
+  }
 
-    setPosts(feedFormatado || []);
+  const fetchConversas = async (userId: string) => {
+    // Busca todas as mensagens envolvendo o usuário
+    const { data } = await supabase
+      .from('mensagens')
+      .select('*, remetente:remetente_id(id, username, avatar_url, full_name), destinatario:destinatario_id(id, username, avatar_url, full_name)')
+      .or(`remetente_id.eq.${userId},destinatario_id.eq.${userId}`)
+      .order('created_at', { ascending: false })
+
+    if (!data) return
+
+    // Agrupa por conversa (par de usuários)
+    const mapaConversas = new Map<string, any>()
+    data.forEach(msg => {
+      const outroId = msg.remetente_id === userId ? msg.destinatario_id : msg.remetente_id
+      const outroUsuario = msg.remetente_id === userId ? msg.destinatario : msg.remetente
+      if (!mapaConversas.has(outroId)) {
+        mapaConversas.set(outroId, {
+          id: outroId,
+          usuario: outroUsuario,
+          ultimaMensagem: msg,
+          naoLidas: 0
+        })
+      }
+      if (!msg.lida && msg.destinatario_id === userId) {
+        const conv = mapaConversas.get(outroId)!
+        conv.naoLidas = (conv.naoLidas || 0) + 1
+        mapaConversas.set(outroId, conv)
+      }
+    })
+    setConversas(Array.from(mapaConversas.values()))
+  }
+
+  const fetchMensagens = async (outroUserId: string) => {
+    if (!user) return
+    const { data } = await supabase
+      .from('mensagens')
+      .select('*')
+      .or(`and(remetente_id.eq.${user.id},destinatario_id.eq.${outroUserId}),and(remetente_id.eq.${outroUserId},destinatario_id.eq.${user.id})`)
+      .order('created_at', { ascending: true })
+    setMensagens(data || [])
+    // Marca como lidas
+    await supabase.from('mensagens').update({ lida: true }).eq('destinatario_id', user.id).eq('remetente_id', outroUserId).eq('lida', false)
+    fetchConversas(user.id)
+  }
+
+  // ─── Actions ─────────────────────────────────────────────────────────────
+
+  const marcarComoLidas = async () => {
+    if (!user || !notificacoes.some(n => !n.lida)) return
+    await supabase.from('notificações').update({ lida: true }).eq('usuario_id', user.id).eq('lida', false)
+    setNotificacoes(prev => prev.map(n => ({ ...n, lida: true })))
+  }
+
+  async function criarNotificacao(destinatarioId: string, tipo: 'curtida' | 'comentario' | 'mensagem', postId?: number) {
+    if (!user || destinatarioId === user.id) return
+    await supabase.from('notificações').insert({
+      usuario_id: destinatarioId,
+      autor_id: user.id,
+      tipo,
+      post_id: postId || null
+    })
+  }
+
+  const gerenciarLike = async (post: any) => {
+    if (!user) return
+    const euCurti = post.lista_curtidas?.some((c: any) => c.usuario_id === user.id)
+    if (euCurti) {
+      await supabase.from('curtidas').delete().eq('post_id', post.id).eq('usuario_id', user.id)
+    } else {
+      await supabase.from('curtidas').insert([{ post_id: post.id, usuario_id: user.id }])
+      await criarNotificacao(post.usuario_id, 'curtida', post.id)
+    }
+    fetchPosts()
+  }
+
+  const selecionarImagem = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setImagemPost(file)
+    setImagemPreview(URL.createObjectURL(file))
   }
 
   const enviarPost = async () => {
-    if (!texto.trim()) return
-    const { error } = await supabase.from('posts').insert([{ conteudo: texto, usuario_id: user.id }])
-    if (!error) { setTexto(''); fetchPosts(user.id) }
-  }
+    if (!texto.trim() && !imagemPost) return
 
-  const gerenciarLike = async (postId: number) => {
-    if (!user) return;
-    const post = posts.find(p => p.id === postId);
-    const euCurti = post.lista_curtidas?.some((c: any) => c.usuario_id === user.id);
+    let imagemUrl: string | null = null
 
-    if (euCurti) {
-      const { error: errorDel } = await supabase.from('curtidas').delete().eq('post_id', postId).eq('usuario_id', user.id);
-      if (!errorDel) {
-        await supabase.from('posts').update({ likes_count: Math.max(0, (post.likes_count || 0) - 1) }).eq('id', postId);
-      }
-    } else {
-      const { error: errorIns } = await supabase.from('curtidas').insert([{ post_id: postId, usuario_id: user.id }]);
-      if (!errorIns) {
-        await supabase.from('posts').update({ likes_count: (post.likes_count || 0) + 1 }).eq('id', postId);
+    if (imagemPost) {
+      const nomeArquivo = `${user.id}/${Date.now()}-${imagemPost.name}`
+      const { error: uploadError } = await supabase.storage.from('posts-imagens').upload(nomeArquivo, imagemPost)
+      if (!uploadError) {
+        const { data: urlData } = supabase.storage.from('posts-imagens').getPublicUrl(nomeArquivo)
+        imagemUrl = urlData.publicUrl
       }
     }
-    fetchPosts(user.id);
-  }
 
-  const enviarComentario = async (postId: number) => {
-    if (!novoComentario.trim() || !user) return;
-    
-    const { error } = await supabase.from('comentarios').insert([
-      { post_id: postId, usuario_id: user.id, conteudo: novoComentario }
-    ]);
-    
-    if (error) {
-      console.error("Erro ao comentar:", error.message);
-      alert("Erro ao comentar: " + error.message);
-    } else {
-      setNovoComentario('');
-      fetchPosts(user.id);
+    const { error } = await supabase.from('posts').insert([{
+      conteudo: texto,
+      usuario_id: user.id,
+      imagem_url: imagemUrl
+    }])
+    if (!error) {
+      setTexto('')
+      setImagemPost(null)
+      setImagemPreview(null)
+      fetchPosts()
     }
   }
+
+  const enviarComentario = async (post: any) => {
+    if (!novoComentario.trim() || !user) return
+    const { error } = await supabase.from('comentarios').insert([{ post_id: post.id, usuario_id: user.id, conteudo: novoComentario }])
+    if (!error) {
+      await criarNotificacao(post.usuario_id, 'comentario', post.id)
+      setNovoComentario('')
+      fetchPosts()
+    }
+  }
+
+  const enviarMensagem = async () => {
+    if (!novaMensagem.trim() || !conversaAtiva || !user) return
+    await supabase.from('mensagens').insert([{
+      remetente_id: user.id,
+      destinatario_id: conversaAtiva.id,
+      conteudo: novaMensagem
+    }])
+    setMensagens(prev => [...prev, {
+      remetente_id: user.id,
+      destinatario_id: conversaAtiva.id,
+      conteudo: novaMensagem,
+      created_at: new Date().toISOString(),
+      lida: false
+    }])
+    setNovaMensagem('')
+    fetchConversas(user.id)
+  }
+
+  const abrirConversa = (outroUsuario: any) => {
+    setConversaAtiva(outroUsuario)
+    fetchMensagens(outroUsuario.id)
+    setMostrarModalNovaConversa(false)
+    setBuscaUsuarioDM('')
+    setUsuariosBuscaDM([])
+  }
+
+  const compartilharViaMsg = async (destinatario: any, post: any) => {
+    if (!user) return
+    const textoCompartilhado = `Olha esse post de @${post.usuarios?.username}: "${post.conteudo}"`
+    await supabase.from('mensagens').insert([{
+      remetente_id: user.id,
+      destinatario_id: destinatario.id,
+      conteudo: textoCompartilhado
+    }])
+    setModalCompartilhar(null)
+    setBuscaDestinatario('')
+    setUsuariosBuscaCompartilhar([])
+  }
+
+  // ─── Sub-components ──────────────────────────────────────────────────────
+
+  const RenderAvatar = ({ url, username, size = "w-10 h-10" }: any) => (
+    <div className={`${size} bg-sky-600 rounded-full flex items-center justify-center font-bold uppercase shrink-0 cursor-pointer overflow-hidden border border-gray-800`}>
+      {url ? <img src={url} alt={username} className="w-full h-full object-cover" /> : <span>{username?.[0]}</span>}
+    </div>
+  )
 
   if (loading) return <div className="bg-black min-h-screen text-white flex items-center justify-center font-bold text-4xl italic">X</div>
 
+  const qndNaoLidas = notificacoes.filter(n => !n.lida).length
+  const totalMsgNaoLidas = conversas.reduce((acc, c) => acc + (c.naoLidas || 0), 0)
+
   return (
     <div className="flex min-h-screen bg-black text-[#e7e9ea] max-w-[1250px] mx-auto font-sans">
-      {/* Sidebar */}
+
+      {/* ── SIDEBAR ─────────────────────────────────────────────────────── */}
       <aside className="w-20 xl:w-64 p-2 border-r border-gray-800 sticky top-0 h-screen flex flex-col justify-between shrink-0">
         <div className="space-y-4">
-          <div className="p-3 text-3xl font-bold">X</div>
+          <div className="p-3 text-3xl font-bold cursor-pointer hover:bg-gray-900 w-fit rounded-full transition"
+            onClick={() => { setAbaAtiva('home'); setConversaAtiva(null) }}>X</div>
           <nav className="text-xl font-bold space-y-2">
-            <div className="flex items-center gap-5 p-3 hover:bg-gray-900 rounded-full cursor-pointer transition"><Home size={28}/> <span className="hidden xl:inline">Home</span></div>
-            <div className="flex items-center gap-5 p-3 hover:bg-gray-900 rounded-full cursor-pointer transition"><User size={28}/> <span className="hidden xl:inline">Perfil</span></div>
+
+            {/* Home */}
+            <div onClick={() => { setAbaAtiva('home'); setConversaAtiva(null) }}
+              className="flex items-center gap-5 p-3 hover:bg-gray-900 rounded-full cursor-pointer transition">
+              <Home size={28} /> <span className="hidden xl:inline">Home</span>
+            </div>
+
+            {/* Busca */}
+            <div className="relative" ref={buscaRef}>
+              {!mostrarInputBusca ? (
+                <div onClick={() => setMostrarInputBusca(true)}
+                  className="flex items-center gap-5 p-3 hover:bg-gray-900 rounded-full cursor-pointer transition">
+                  <Search size={28} /> <span className="hidden xl:inline">Buscar</span>
+                </div>
+              ) : (
+                <div className="px-3 py-2">
+                  <div className="flex items-center gap-2 bg-[#202327] p-3 rounded-full border border-sky-500">
+                    <Search size={20} className="text-sky-500 shrink-0" />
+                    <input autoFocus value={busca} onChange={(e) => setBusca(e.target.value)}
+                      placeholder="Buscar..." className="bg-transparent outline-none text-sm w-full" />
+                  </div>
+                  {usuariosEncontrados.length > 0 && (
+                    <div className="absolute left-0 right-0 top-full mt-2 bg-black border border-gray-800 rounded-xl shadow-2xl z-50 overflow-hidden">
+                      {usuariosEncontrados.map(u => (
+                        <div key={u.username}
+                          onClick={() => { router.push(`/perfil/${u.username}`); setMostrarInputBusca(false) }}
+                          className="flex items-center gap-3 p-3 hover:bg-white/5 cursor-pointer">
+                          <RenderAvatar url={u.avatar_url} username={u.username} size="w-8 h-8" />
+                          <div className="text-sm">
+                            <p className="font-bold">{u.full_name}</p>
+                            <p className="text-gray-500 text-xs">@{u.username}</p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Perfil */}
+            <div onClick={() => router.push(`/perfil/${perfil?.username}`)}
+              className="flex items-center gap-5 p-3 hover:bg-gray-900 rounded-full cursor-pointer transition">
+              <User size={28} /> <span className="hidden xl:inline">Perfil</span>
+            </div>
+
+            {/* Notificações */}
+            <div onClick={() => { setAbaAtiva('notificacoes'); marcarComoLidas() }}
+              className="flex items-center gap-5 p-3 hover:bg-gray-900 rounded-full cursor-pointer transition relative">
+              <div className="relative">
+                <Bell size={28} />
+                {qndNaoLidas > 0 && (
+                  <div className="absolute -top-1 -right-1 bg-sky-500 text-[10px] w-5 h-5 flex items-center justify-center rounded-full border-2 border-black font-bold">
+                    {qndNaoLidas}
+                  </div>
+                )}
+              </div>
+              <span className="hidden xl:inline">Notificações</span>
+            </div>
+
+            {/* Mensagens */}
+            <div onClick={() => { setAbaAtiva('mensagens'); setConversaAtiva(null) }}
+              className="flex items-center gap-5 p-3 hover:bg-gray-900 rounded-full cursor-pointer transition relative">
+              <div className="relative">
+                <MessageCircle size={28} />
+                {totalMsgNaoLidas > 0 && (
+                  <div className="absolute -top-1 -right-1 bg-sky-500 text-[10px] w-5 h-5 flex items-center justify-center rounded-full border-2 border-black font-bold">
+                    {totalMsgNaoLidas}
+                  </div>
+                )}
+              </div>
+              <span className="hidden xl:inline">Mensagens</span>
+            </div>
+
           </nav>
         </div>
-        <button onClick={() => { supabase.auth.signOut(); router.push('/login') }} className="mb-4 p-3 text-red-500 hover:bg-red-950/20 rounded-full flex gap-4 font-bold items-center justify-center xl:justify-start">
-          <LogOut size={24}/> <span className="hidden xl:inline">Sair</span>
+        <button onClick={() => { supabase.auth.signOut(); router.push('/login') }}
+          className="mb-4 p-3 text-red-500 hover:bg-red-950/20 rounded-full flex gap-4 font-bold items-center transition">
+          <LogOut size={24} /> <span className="hidden xl:inline">Sair</span>
         </button>
       </aside>
 
-      {/* Feed */}
+      {/* ── ÁREA CENTRAL ────────────────────────────────────────────────── */}
       <main className="flex-1 border-r border-gray-800 max-w-[600px] w-full">
-        <div className="p-4 border-b border-gray-800 sticky top-0 bg-black/80 backdrop-blur-md z-10 font-bold text-xl">Página Inicial</div>
-        
-        {/* Input de Post */}
-        <div className="p-4 border-b border-gray-800 flex gap-4">
-          <div className="w-10 h-10 bg-sky-600 rounded-full flex items-center justify-center font-bold uppercase shrink-0">{perfil?.username?.[0]}</div>
-          <div className="flex-1">
-            <textarea value={texto} onChange={e => setTexto(e.target.value)} className="w-full bg-transparent text-xl outline-none placeholder-gray-600 resize-none mt-2" placeholder="O que está acontecendo?" rows={2} />
-            <div className="flex justify-end pt-3 border-t border-gray-800">
-              <button onClick={enviarPost} className="bg-sky-500 hover:bg-sky-600 px-5 py-2 rounded-full font-bold transition">Postar</button>
+
+        {/* ── HEADER ── */}
+        <div className="p-4 border-b border-gray-800 sticky top-0 bg-black/80 backdrop-blur-md z-10 flex justify-between items-center">
+          {abaAtiva === 'mensagens' && conversaAtiva ? (
+            <div className="flex items-center gap-3">
+              <button onClick={() => setConversaAtiva(null)} className="hover:bg-gray-900 p-2 rounded-full">
+                <ArrowLeft size={20} />
+              </button>
+              <RenderAvatar url={conversaAtiva.usuario?.avatar_url} username={conversaAtiva.usuario?.username} size="w-8 h-8" />
+              <div>
+                <p className="font-bold text-sm">{conversaAtiva.usuario?.full_name}</p>
+                <p className="text-gray-500 text-xs">@{conversaAtiva.usuario?.username}</p>
+              </div>
+            </div>
+          ) : (
+            <span className="font-bold text-xl">
+              {abaAtiva === 'home' && 'Página Inicial'}
+              {abaAtiva === 'notificacoes' && 'Notificações'}
+              {abaAtiva === 'mensagens' && 'Mensagens'}
+            </span>
+          )}
+          {abaAtiva === 'notificacoes' && (
+            <button onClick={() => setAbaAtiva('home')} className="hover:bg-gray-900 p-2 rounded-full">
+              <CloseIcon size={20} />
+            </button>
+          )}
+          {abaAtiva === 'mensagens' && !conversaAtiva && (
+            <button onClick={() => setMostrarModalNovaConversa(true)}
+              className="bg-sky-500 hover:bg-sky-600 px-4 py-1.5 rounded-full font-bold text-sm transition">
+              Nova mensagem
+            </button>
+          )}
+        </div>
+
+        {/* ── ABA HOME ── */}
+        {abaAtiva === 'home' && (
+          <>
+            {/* Input de post */}
+            <div className="p-4 border-b border-gray-800 flex gap-4">
+              <RenderAvatar url={perfil?.avatar_url} username={perfil?.username} />
+              <div className="flex-1">
+                <textarea value={texto} onChange={e => setTexto(e.target.value)}
+                  className="w-full bg-transparent text-xl outline-none placeholder-gray-600 resize-none mt-2"
+                  placeholder="O que está acontecendo? Use #hashtags!" rows={2} />
+
+                {/* Preview da imagem */}
+                {imagemPreview && (
+                  <div className="relative mt-2 rounded-xl overflow-hidden border border-gray-800">
+                    <img src={imagemPreview} alt="preview" className="w-full max-h-72 object-cover" />
+                    <button onClick={() => { setImagemPost(null); setImagemPreview(null) }}
+                      className="absolute top-2 right-2 bg-black/70 rounded-full p-1 hover:bg-black">
+                      <CloseIcon size={16} />
+                    </button>
+                  </div>
+                )}
+
+                <div className="flex justify-between pt-3 border-t border-gray-800 items-center">
+                  <button onClick={() => inputImagemRef.current?.click()}
+                    className="text-sky-500 hover:bg-sky-500/10 p-2 rounded-full transition">
+                    <ImageIcon size={20} />
+                  </button>
+                  <input ref={inputImagemRef} type="file" accept="image/*" onChange={selecionarImagem} className="hidden" />
+                  <button onClick={enviarPost}
+                    className="bg-sky-500 hover:bg-sky-600 px-5 py-2 rounded-full font-bold transition">
+                    Postar
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Lista de posts */}
+            <div className="divide-y divide-gray-800">
+              {posts.map(post => {
+                const jaCurti = post.lista_curtidas?.some((c: any) => c.usuario_id === user?.id)
+                return (
+                  <div key={post.id} className="p-4 hover:bg-white/[0.02] transition">
+                    <div className="flex gap-3">
+                      <RenderAvatar url={post.usuarios?.avatar_url} username={post.usuarios?.username} />
+                      <div className="flex-1">
+                        <div className="flex gap-1.5 items-center">
+                          <span className="font-bold hover:underline cursor-pointer"
+                            onClick={() => router.push(`/perfil/${post.usuarios?.username}`)}>
+                            @{post.usuarios?.username}
+                          </span>
+                          <span className="text-gray-500 text-sm">· {formatarDataX(post.created_at)}</span>
+                        </div>
+
+                        <RenderTextoComHashtags texto={post.conteudo || ''} />
+
+                        {/* Imagem do post */}
+                        {post.imagem_url && (
+                          <div className="mt-2 rounded-xl overflow-hidden border border-gray-800">
+                            <img src={post.imagem_url} alt="imagem do post" className="w-full max-h-80 object-cover" />
+                          </div>
+                        )}
+
+                        <div className="flex justify-between mt-3 text-gray-500 max-w-md">
+                          <div onClick={() => setComentandoEm(comentandoEm === post.id ? null : post.id)}
+                            className="flex items-center gap-2 cursor-pointer hover:text-sky-500 transition">
+                            <MessageCircle size={18} /> <span className="text-xs">{post.comentarios?.length}</span>
+                          </div>
+                          <div onClick={() => gerenciarLike(post)}
+                            className={`flex items-center gap-2 cursor-pointer hover:text-pink-500 transition ${jaCurti ? 'text-pink-500' : ''}`}>
+                            <Heart size={18} className={jaCurti ? "fill-pink-500" : ""} />
+                            <span className="text-xs">{post.lista_curtidas?.length}</span>
+                          </div>
+                          {/* Botão compartilhar */}
+                          <div onClick={() => { setModalCompartilhar(post); setBuscaDestinatario(''); setUsuariosBuscaCompartilhar([]) }}
+                            className="flex items-center gap-2 cursor-pointer hover:text-green-500 transition">
+                            <Share size={18} />
+                          </div>
+                        </div>
+
+                        {/* Comentários */}
+                        {comentandoEm === post.id && (
+                          <div className="mt-4 space-y-4">
+                            <div className="flex gap-3">
+                              <RenderAvatar url={perfil?.avatar_url} username={perfil?.username} size="w-8 h-8" />
+                              <div className="flex-1 flex gap-2">
+                                <input value={novoComentario} onChange={e => setNovoComentario(e.target.value)}
+                                  className="flex-1 bg-zinc-900 rounded-full px-4 py-1 text-sm outline-none border border-transparent focus:border-sky-500"
+                                  placeholder="Sua resposta..." />
+                                <button onClick={() => enviarComentario(post)}
+                                  className="bg-sky-500 px-4 py-1 rounded-full text-xs font-bold hover:bg-sky-600 transition">
+                                  Responder
+                                </button>
+                              </div>
+                            </div>
+                            {post.comentarios?.map((c: any) => (
+                              <div key={c.id} className="flex gap-3 text-sm bg-white/5 p-3 rounded-2xl">
+                                <RenderAvatar url={c.usuarios?.avatar_url} username={c.usuarios?.username} size="w-7 h-7" />
+                                <div className="flex-1">
+                                  <p className="font-bold">@{c.usuarios?.username}</p>
+                                  <p className="text-gray-200">{c.conteudo}</p>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </>
+        )}
+
+        {/* ── ABA NOTIFICAÇÕES ── */}
+        {abaAtiva === 'notificacoes' && (
+          <div className="divide-y divide-gray-800">
+            {notificacoes.length === 0 ? (
+              <p className="p-10 text-center text-gray-500 italic font-medium">Nada por aqui ainda.</p>
+            ) : (
+              notificacoes.map(n => (
+                <div key={n.id}
+                  className={`p-4 flex gap-4 items-start transition ${!n.lida ? 'bg-sky-500/10' : 'hover:bg-white/[0.02]'}`}>
+                  <div className="mt-1 shrink-0">
+                    {n.tipo === 'curtida' && <Heart size={22} className="text-pink-500 fill-pink-500" />}
+                    {n.tipo === 'comentario' && <MessageCircle size={22} className="text-sky-500 fill-sky-500" />}
+                    {n.tipo === 'seguidor' && <User size={22} className="text-sky-400" />}
+                    {n.tipo === 'mensagem' && <Send size={22} className="text-green-400" />}
+                  </div>
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2 mb-1 cursor-pointer"
+                      onClick={() => router.push(`/perfil/${n.autor?.username}`)}>
+                      <RenderAvatar url={n.autor?.avatar_url} username={n.autor?.username} size="w-8 h-8" />
+                      <span className="font-bold text-sm hover:underline">@{n.autor?.username}</span>
+                    </div>
+                    <p className="text-sm text-gray-300">
+                      {n.tipo === 'curtida' && 'curtiu seu post'}
+                      {n.tipo === 'comentario' && 'comentou no seu post'}
+                      {n.tipo === 'seguidor' && 'começou a te seguir'}
+                      {n.tipo === 'mensagem' && 'te enviou uma mensagem'}
+                    </p>
+                    <span className="text-[10px] text-gray-500 uppercase font-bold mt-1 block">{formatarDataX(n.created_at)}</span>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
+        {/* ── ABA MENSAGENS ── */}
+        {abaAtiva === 'mensagens' && (
+          <>
+            {!conversaAtiva ? (
+              /* Lista de conversas */
+              <div className="divide-y divide-gray-800">
+                {conversas.length === 0 ? (
+                  <p className="p-10 text-center text-gray-500 italic">Nenhuma conversa ainda.</p>
+                ) : (
+                  conversas.map(conversa => (
+                    <div key={conversa.id} onClick={() => abrirConversa(conversa)}
+                      className="p-4 flex gap-3 hover:bg-white/[0.02] cursor-pointer transition items-center">
+                      <div className="relative">
+                        <RenderAvatar url={conversa.usuario?.avatar_url} username={conversa.usuario?.username} />
+                        {conversa.naoLidas > 0 && (
+                          <div className="absolute -top-1 -right-1 bg-sky-500 text-[10px] w-4 h-4 flex items-center justify-center rounded-full border-2 border-black font-bold">
+                            {conversa.naoLidas}
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex justify-between items-center">
+                          <p className="font-bold text-sm">{conversa.usuario?.full_name}</p>
+                          <span className="text-gray-500 text-xs">{formatarDataX(conversa.ultimaMensagem?.created_at)}</span>
+                        </div>
+                        <p className={`text-sm truncate ${conversa.naoLidas > 0 ? 'text-white font-semibold' : 'text-gray-500'}`}>
+                          {conversa.ultimaMensagem?.conteudo}
+                        </p>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            ) : (
+              /* Chat ativo */
+              <div className="flex flex-col h-[calc(100vh-65px)]">
+                <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                  {mensagens.map((msg, i) => {
+                    const euEnviei = msg.remetente_id === user?.id
+                    return (
+                      <div key={i} className={`flex ${euEnviei ? 'justify-end' : 'justify-start'}`}>
+                        <div className={`max-w-[75%] px-4 py-2.5 rounded-2xl text-sm ${euEnviei ? 'bg-sky-500 text-white rounded-br-sm' : 'bg-[#202327] text-[#e7e9ea] rounded-bl-sm'}`}>
+                          <p>{msg.conteudo}</p>
+                          <p className={`text-[10px] mt-1 ${euEnviei ? 'text-sky-200' : 'text-gray-500'}`}>
+                            {formatarDataX(msg.created_at)}
+                          </p>
+                        </div>
+                      </div>
+                    )
+                  })}
+                  <div ref={mensagensEndRef} />
+                </div>
+                {/* Input de mensagem */}
+                <div className="p-4 border-t border-gray-800 flex gap-3 items-center">
+                  <input value={novaMensagem} onChange={e => setNovaMensagem(e.target.value)}
+                    onKeyDown={e => e.key === 'Enter' && !e.shiftKey && enviarMensagem()}
+                    className="flex-1 bg-[#202327] rounded-full px-4 py-2.5 text-sm outline-none border border-transparent focus:border-sky-500"
+                    placeholder="Nova mensagem..." />
+                  <button onClick={enviarMensagem}
+                    className="bg-sky-500 hover:bg-sky-600 p-2.5 rounded-full transition shrink-0">
+                    <Send size={18} />
+                  </button>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </main>
+
+      {/* ── MODAL: Nova Conversa ─────────────────────────────────────────── */}
+      {mostrarModalNovaConversa && (
+        <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4" onClick={() => setMostrarModalNovaConversa(false)}>
+          <div className="bg-[#0f0f0f] border border-gray-800 rounded-2xl w-full max-w-sm shadow-2xl" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between p-4 border-b border-gray-800">
+              <h2 className="font-bold text-lg">Nova mensagem</h2>
+              <button onClick={() => setMostrarModalNovaConversa(false)} className="hover:bg-gray-900 p-2 rounded-full"><CloseIcon size={18} /></button>
+            </div>
+            <div className="p-4">
+              <div className="flex items-center gap-2 bg-[#202327] p-3 rounded-full border border-sky-500">
+                <Search size={18} className="text-sky-500 shrink-0" />
+                <input autoFocus value={buscaUsuarioDM} onChange={e => setBuscaUsuarioDM(e.target.value)}
+                  placeholder="Buscar usuário..." className="bg-transparent outline-none text-sm w-full" />
+              </div>
+              <div className="mt-2 space-y-1">
+                {usuariosBuscaDM.map(u => (
+                  <div key={u.id} onClick={() => { abrirConversa({ id: u.id, usuario: u }); setAbaAtiva('mensagens') }}
+                    className="flex items-center gap-3 p-3 hover:bg-white/5 rounded-xl cursor-pointer">
+                    <RenderAvatar url={u.avatar_url} username={u.username} size="w-9 h-9" />
+                    <div>
+                      <p className="font-bold text-sm">{u.full_name}</p>
+                      <p className="text-gray-500 text-xs">@{u.username}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
         </div>
+      )}
 
-        {/* Lista de Tweets */}
-        <div className="divide-y divide-gray-800">
-          {posts.map(post => {
-            const euCurti = post.lista_curtidas?.some((c: any) => c.usuario_id === user?.id);
-            
-            return (
-              <div key={post.id} className="p-4 hover:bg-white/[0.02] transition duration-200">
-                <div className="flex gap-3">
-                  <div className="w-10 h-10 bg-gray-800 rounded-full flex items-center justify-center font-bold text-sm uppercase shrink-0">{post.usuarios?.username?.[0]}</div>
-                  <div className="flex-1">
-                    <div className="flex justify-between">
-                      <div className="flex gap-1.5 items-center">
-                        <span className="font-bold hover:underline cursor-pointer">{post.usuarios?.full_name}</span>
-                        <span className="text-gray-500 text-sm">@{post.usuarios?.username}</span>
-                      </div>
-                      <MoreHorizontal size={18} className="text-gray-500 cursor-pointer" />
-                    </div>
-                    <p className="mt-1 text-[15px] leading-normal">{post.conteudo}</p>
-                    
-                    {/* Botões de Ação */}
-                    <div className="flex justify-between mt-3 text-gray-500 max-w-md">
-                      <div onClick={() => setComentandoEm(comentandoEm === post.id ? null : post.id)} className="flex items-center gap-2 group cursor-pointer hover:text-sky-500 transition">
-                        <div className="p-2 group-hover:bg-sky-500/10 rounded-full"><MessageCircle size={18} /></div>
-                        <span className="text-xs">{post.comentarios?.length || 0}</span>
-                      </div>
-                      
-                      <div onClick={() => gerenciarLike(post.id)} className={`flex items-center gap-2 group cursor-pointer hover:text-pink-500 transition ${euCurti ? 'text-pink-500' : ''}`}>
-                        <div className="p-2 group-hover:bg-pink-500/10 rounded-full">
-                          <Heart size={18} className={euCurti ? "fill-pink-500 text-pink-500" : ""} />
-                        </div>
-                        <span className="text-xs">{post.likes_count || 0}</span>
-                      </div>
-
-                      <div className="p-2 hover:bg-green-500/10 hover:text-green-500 rounded-full transition cursor-pointer"><Share size={18} /></div>
-                    </div>
-
-                    {/* Área de Respostas */}
-                    {comentandoEm === post.id && (
-                      <div className="mt-4 bg-[#16181c] p-4 rounded-2xl border border-gray-800 shadow-xl">
-                        <div className="flex gap-2 mb-4">
-                          <input 
-                            value={novoComentario} 
-                            onChange={e => setNovoComentario(e.target.value)} 
-                            className="flex-1 bg-transparent border-b border-gray-700 outline-none text-sm py-1 focus:border-sky-500 transition" 
-                            placeholder="Postar sua resposta" 
-                          />
-                          <button onClick={() => enviarComentario(post.id)} className="bg-sky-500 px-4 py-1 rounded-full text-white text-xs font-bold hover:bg-sky-600 transition">Responder</button>
-                        </div>
-                        <div className="space-y-4 max-h-60 overflow-y-auto pr-2">
-                          {post.comentarios?.map((c: any) => (
-                            <div key={c.id} className="text-[13px] flex gap-2">
-                              <div className="w-6 h-6 bg-gray-700 rounded-full flex items-center justify-center text-[10px] font-bold uppercase shrink-0">{c.usuarios?.username?.[0]}</div>
-                              <div className="flex-1">
-                                <span className="font-bold">@{c.usuarios?.username}</span>
-                                <p className="text-gray-300 mt-0.5">{c.conteudo}</p>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
+      {/* ── MODAL: Compartilhar Post ─────────────────────────────────────── */}
+      {modalCompartilhar && (
+        <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4" onClick={() => setModalCompartilhar(null)}>
+          <div className="bg-[#0f0f0f] border border-gray-800 rounded-2xl w-full max-w-sm shadow-2xl" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between p-4 border-b border-gray-800">
+              <h2 className="font-bold text-lg">Compartilhar via mensagem</h2>
+              <button onClick={() => setModalCompartilhar(null)} className="hover:bg-gray-900 p-2 rounded-full"><CloseIcon size={18} /></button>
+            </div>
+            {/* Preview do post */}
+            <div className="mx-4 mt-4 p-3 bg-white/5 border border-gray-800 rounded-xl text-sm text-gray-400 line-clamp-2">
+              <span className="font-bold text-white">@{modalCompartilhar.usuarios?.username}</span> · {modalCompartilhar.conteudo}
+            </div>
+            <div className="p-4">
+              <div className="flex items-center gap-2 bg-[#202327] p-3 rounded-full border border-sky-500">
+                <Search size={18} className="text-sky-500 shrink-0" />
+                <input autoFocus value={buscaDestinatario} onChange={e => setBuscaDestinatario(e.target.value)}
+                  placeholder="Buscar destinatário..." className="bg-transparent outline-none text-sm w-full" />
               </div>
-            );
-          })}
+              <div className="mt-2 space-y-1">
+                {usuariosBuscaCompartilhar.map(u => (
+                  <div key={u.id} onClick={() => compartilharViaMsg(u, modalCompartilhar)}
+                    className="flex items-center justify-between p-3 hover:bg-white/5 rounded-xl cursor-pointer">
+                    <div className="flex items-center gap-3">
+                      <RenderAvatar url={u.avatar_url} username={u.username} size="w-9 h-9" />
+                      <div>
+                        <p className="font-bold text-sm">{u.full_name}</p>
+                        <p className="text-gray-500 text-xs">@{u.username}</p>
+                      </div>
+                    </div>
+                    <button className="bg-sky-500 hover:bg-sky-600 px-3 py-1 rounded-full text-xs font-bold transition">
+                      Enviar
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
         </div>
-      </main>
+      )}
+
     </div>
   )
 }
