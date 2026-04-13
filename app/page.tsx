@@ -176,7 +176,7 @@ export default function Feed() {
       const { data: { session } } = await supabase.auth.getSession()
       if (!session) { router.push('/login'); return }
 
-      const { data: p } = await supabase.from('usuarios').select('*').eq('id', session.user.id).single()
+     const { data: p } = await supabase.from('usuarios').select('*').eq('id', session.user.id).single()
       if (!p) { await supabase.auth.signOut(); router.push('/login'); return }
 
       userRef.current = session.user
