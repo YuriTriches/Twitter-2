@@ -98,6 +98,7 @@ export default function Feed() {
   useEffect(() => {
     let canalNotifs: any
     let canalMsgs: any
+    let canalPosts: any
 
     const inicializar = async () => {
       const { data: { session } } = await supabase.auth.getSession()
@@ -112,6 +113,14 @@ export default function Feed() {
       fetchNotificacoes(session.user.id)
       fetchConversas(session.user.id)
       setLoading(false)
+
+      // Realtime: posts (novo post, curtida, comentário atualiza o feed)
+      supabase.removeChannel(supabase.channel('posts-realtime'))
+      canalPosts = supabase.channel('posts-realtime')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'posts' }, () => fetchPosts())
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'curtidas' }, () => fetchPosts())
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'comentarios' }, () => fetchPosts())
+        .subscribe()
 
       // Realtime: notificações
       const canalNomeNotifs = `notifs-${session.user.id}`
@@ -130,9 +139,7 @@ export default function Feed() {
       canalMsgs = supabase.channel(canalNomeMsgs)
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'mensagens', filter: `destinatario_id=eq.${session.user.id}` },
           async (payload) => {
-            // Atualiza badge de mensagens não lidas
             fetchConversas(session.user.id)
-            // Se a conversa com esse remetente está aberta, adiciona a mensagem
             setConversaAtiva((conv: any) => {
               if (conv && conv.id === payload.new.remetente_id) {
                 setMensagens(prev => [...prev, payload.new])
@@ -145,6 +152,7 @@ export default function Feed() {
 
     inicializar()
     return () => {
+      if (canalPosts) supabase.removeChannel(canalPosts)
       if (canalNotifs) supabase.removeChannel(canalNotifs)
       if (canalMsgs) supabase.removeChannel(canalMsgs)
     }
@@ -294,11 +302,19 @@ export default function Feed() {
 
     if (imagemPost) {
       const nomeArquivo = `${user.id}/${Date.now()}-${imagemPost.name}`
-      const { error: uploadError } = await supabase.storage.from('posts-imagens').upload(nomeArquivo, imagemPost)
-      if (!uploadError) {
-        const { data: urlData } = supabase.storage.from('posts-imagens').getPublicUrl(nomeArquivo)
-        imagemUrl = urlData.publicUrl
+      const { error: uploadError } = await supabase.storage
+        .from('posts-imagens')
+        .upload(nomeArquivo, imagemPost)
+
+      if (uploadError) {
+        console.error('Erro no upload da imagem:', uploadError)
+        return
       }
+
+      const { data: urlData } = supabase.storage
+        .from('posts-imagens')
+        .getPublicUrl(nomeArquivo)
+      imagemUrl = urlData.publicUrl
     }
 
     const { error } = await supabase.from('posts').insert([{
@@ -306,11 +322,12 @@ export default function Feed() {
       usuario_id: user.id,
       imagem_url: imagemUrl
     }])
+
     if (!error) {
       setTexto('')
       setImagemPost(null)
       setImagemPreview(null)
-      fetchPosts()
+      // sem fetchPosts() — o Realtime cuida disso automaticamente
     }
   }
 
