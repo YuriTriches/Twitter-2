@@ -2,13 +2,12 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 
-const app = express(); // <--- Faltava essa linha que define o 'app'!
+const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Seus dados do Supabase que você mandou
-const SUPABASE_URL = 'https://bqgnoafpjdlzxedqupsr.supabase.co';
-const SUPABASE_KEY = 'sb_publishable_oUAHskL6NFf5qePTP8ofiA_o-oKh-1H';
+const SUPABASE_URL = '';
+const SUPABASE_KEY = '';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // 1. REGISTRAR (Adaptado para sua tabela 'usuarios')
